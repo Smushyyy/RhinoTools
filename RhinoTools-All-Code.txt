@@ -1,0 +1,1691 @@
+================================================================================
+  RHINO 3D TOOLS — STREAM DECK PLUGIN
+  Complete source code — all files in one document
+================================================================================
+
+Project structure:
+  C:\RhinoTools\
+  ├── package.json                                  (npm config & dependencies)
+  ├── tsconfig.json                                 (TypeScript compiler config)
+  ├── rollup.config.mjs                             (bundler config)
+  ├── generate-profile.mjs                          (run once to install SD profile)
+  ├── src\
+  │   ├── plugin.ts                                 (plugin entry point)
+  │   ├── send-keys.ts                              (PowerShell macro helper)
+  │   └── actions\
+  │       └── rhino-tool.ts                         (button action + tool catalogue)
+  └── com.rhino3d.tools.sdPlugin\
+      ├── manifest.json                             (Stream Deck plugin manifest)
+      └── ui\
+          └── tool-picker.html                      (Property Inspector UI)
+
+Build commands:
+  npm install          — install dependencies
+  npm run build        — bundle TypeScript → bin/plugin.js
+  node generate-profile.mjs  — generate & install the Stream Deck profile
+
+================================================================================
+FILE 1 of 9:  package.json
+================================================================================
+
+{
+  "name": "com.rhino3d.tools",
+  "version": "1.0.0",
+  "description": "One-press Rhino 3D tool buttons for Stream Deck",
+  "private": true,
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c --watch"
+  },
+  "dependencies": {
+    "@elgato/streamdeck": "^1.1.0"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@rollup/plugin-commonjs": "^25.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "@types/node": "^20.19.39",
+    "pngjs": "^7.0.0",
+    "rollup": "^4.0.0",
+    "tslib": "^2.6.0",
+    "typescript": "^5.0.0"
+  }
+}
+
+================================================================================
+FILE 2 of 9:  tsconfig.json
+================================================================================
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2020",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*"]
+}
+
+================================================================================
+FILE 3 of 9:  rollup.config.mjs
+================================================================================
+
+import { defineConfig } from "rollup";
+import typescript from "@rollup/plugin-typescript";
+import nodeResolve from "@rollup/plugin-node-resolve";
+import commonjs from "@rollup/plugin-commonjs";
+
+export default defineConfig({
+    input: "src/plugin.ts",
+    output: {
+        file: "com.rhino3d.tools.sdPlugin/bin/plugin.js",
+        format: "esm",
+        sourcemap: true
+    },
+    plugins: [
+        typescript({ tsconfig: "./tsconfig.json" }),
+        nodeResolve({ browser: false, preferBuiltins: true }),
+        commonjs()
+    ],
+    external: [
+        "stream", "net", "http", "https", "url", "path",
+        "os", "fs", "events", "util", "buffer", "child_process"
+    ]
+});
+
+================================================================================
+FILE 4 of 9:  src/plugin.ts
+================================================================================
+
+import streamDeck, { LogLevel } from "@elgato/streamdeck";
+import { RhinoToolAction } from "./actions/rhino-tool";
+
+streamDeck.logger.setLevel(LogLevel.TRACE);
+streamDeck.actions.registerAction(new RhinoToolAction());
+await streamDeck.connect();
+
+/*
+  NOTE: The @action decorator sets the UUID on the class but does NOT
+  auto-register the action. You MUST call registerAction() explicitly,
+  otherwise no buttons will fire — this is the most common gotcha.
+*/
+
+================================================================================
+FILE 5 of 9:  src/send-keys.ts
+================================================================================
+
+import { exec } from "child_process";
+
+/**
+ * Types a Rhino command into the active window, exactly like a keyboard macro.
+ *
+ * PowerShell runs hidden (no window, no focus stealing).
+ * Stream Deck button presses don't steal focus, so Rhino stays active
+ * and receives the keystrokes directly.
+ */
+export function sendCommandToRhino(command: string): Promise<boolean> {
+    return new Promise((resolve) => {
+        // Escape single quotes for the PS single-quoted string
+        const safeCmd = command.replace(/'/g, "''");
+
+        const script = [
+            "Add-Type -AssemblyName System.Windows.Forms",
+            `[System.Windows.Forms.SendKeys]::SendWait('${safeCmd} ')`,
+        ].join("\n");
+
+        // Encode as UTF-16 LE base64 — required by PowerShell -EncodedCommand
+        const buf = Buffer.alloc(script.length * 2);
+        for (let i = 0; i < script.length; i++) buf.writeUInt16LE(script.charCodeAt(i), i * 2);
+        const encoded = buf.toString("base64");
+
+        exec(
+            `powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ${encoded}`,
+            { timeout: 5000 },
+            (err: Error | null) => resolve(err === null)
+        );
+    });
+}
+
+================================================================================
+FILE 6 of 9:  src/actions/rhino-tool.ts
+================================================================================
+
+import {
+    action,
+    KeyDownEvent,
+    SingletonAction,
+    WillAppearEvent,
+    DidReceiveSettingsEvent
+} from "@elgato/streamdeck";
+import { sendCommandToRhino } from "../send-keys";
+
+// -----------------------------------------------------------------------
+// Tool catalogue
+// -----------------------------------------------------------------------
+
+export interface Tool     { label: string; command: string; }
+export interface Category { label: string; tools: Tool[]; }
+
+export const CATALOGUE: Category[] = [
+    {
+        label: "Draw — Curves",
+        tools: [
+            { label: "Line",              command: "_Line" },
+            { label: "Polyline",          command: "_Polyline" },
+            { label: "Free-form Curve",   command: "_Curve" },
+            { label: "Arc",               command: "_Arc" },
+            { label: "Circle",            command: "_Circle" },
+            { label: "Ellipse",           command: "_Ellipse" },
+            { label: "Rectangle",         command: "_Rectangle" },
+            { label: "Polygon",           command: "_Polygon" },
+            { label: "Helix",             command: "_Helix" },
+            { label: "Spiral",            command: "_Spiral" },
+            { label: "Interpolate Pts",   command: "_InterpCrv" },
+            { label: "Sketch",            command: "_Sketch" },
+            { label: "Point",             command: "_Point" },
+            { label: "Text",              command: "_Text" },
+        ]
+    },
+    {
+        label: "Draw — Surfaces",
+        tools: [
+            { label: "Plane",             command: "_Plane" },
+            { label: "Edge Surface",      command: "_EdgeSrf" },
+            { label: "Loft",              command: "_Loft" },
+            { label: "Sweep 1 Rail",      command: "_Sweep1" },
+            { label: "Sweep 2 Rails",     command: "_Sweep2" },
+            { label: "Revolve",           command: "_Revolve" },
+            { label: "Rail Revolve",      command: "_RailRevolve" },
+            { label: "Network Surface",   command: "_NetworkSrf" },
+            { label: "Planar Surface",    command: "_PlanarSrf" },
+            { label: "Patch",             command: "_Patch" },
+            { label: "Extrude Curve",     command: "_ExtrudeCrv" },
+            { label: "Extrude Surface",   command: "_ExtrudeSrf" },
+            { label: "Offset Surface",    command: "_OffsetSrf" },
+        ]
+    },
+    {
+        label: "Draw — Solids",
+        tools: [
+            { label: "Box",               command: "_Box" },
+            { label: "Sphere",            command: "_Sphere" },
+            { label: "Cylinder",          command: "_Cylinder" },
+            { label: "Cone",              command: "_Cone" },
+            { label: "Truncated Cone",    command: "_TCone" },
+            { label: "Torus",             command: "_Torus" },
+            { label: "Pipe",              command: "_Pipe" },
+        ]
+    },
+    {
+        label: "Modify — Edit",
+        tools: [
+            { label: "Trim",              command: "_Trim" },
+            { label: "Split",             command: "_Split" },
+            { label: "Extend",            command: "_Extend" },
+            { label: "Join",              command: "_Join" },
+            { label: "Explode",           command: "_Explode" },
+            { label: "Offset Curve",      command: "_Offset" },
+            { label: "Fillet Curves",     command: "_Fillet" },
+            { label: "Chamfer Curves",    command: "_Chamfer" },
+            { label: "Rebuild Curve",     command: "_Rebuild" },
+            { label: "Match Curves",      command: "_Match" },
+            { label: "Fair Curve",        command: "_Fair" },
+            { label: "Simplify Curve",    command: "_SimplifyCrv" },
+            { label: "Project Curve",     command: "_Project" },
+            { label: "Pull Curve",        command: "_Pull" },
+        ]
+    },
+    {
+        label: "Modify — Transform",
+        tools: [
+            { label: "Move",              command: "_Move" },
+            { label: "Copy",              command: "_Copy" },
+            { label: "Rotate",            command: "_Rotate" },
+            { label: "Rotate 3D",         command: "_Rotate3D" },
+            { label: "Scale",             command: "_Scale" },
+            { label: "Scale 1D",          command: "_Scale1D" },
+            { label: "Scale 2D",          command: "_Scale2D" },
+            { label: "Mirror",            command: "_Mirror" },
+            { label: "Array Linear",      command: "_Array" },
+            { label: "Array Polar",       command: "_ArrayPolar" },
+            { label: "Array Along Crv",   command: "_ArrayCrv" },
+            { label: "Orient",            command: "_Orient" },
+            { label: "Orient on Srf",     command: "_OrientOnSrf" },
+            { label: "Flow Along Crv",    command: "_Flow" },
+            { label: "Bend",              command: "_Bend" },
+            { label: "Twist",             command: "_Twist" },
+            { label: "Taper",             command: "_Taper" },
+            { label: "Shear",             command: "_Shear" },
+        ]
+    },
+    {
+        label: "Modify — Solids",
+        tools: [
+            { label: "Boolean Union",     command: "_BooleanUnion" },
+            { label: "Boolean Diff",      command: "_BooleanDifference" },
+            { label: "Boolean Intersect", command: "_BooleanIntersection" },
+            { label: "Boolean Split",     command: "_BooleanSplit" },
+            { label: "Fillet Edge",       command: "_FilletEdge" },
+            { label: "Chamfer Edge",      command: "_ChamferEdge" },
+            { label: "Shell",             command: "_Shell" },
+            { label: "Cap",               command: "_Cap" },
+            { label: "Extract Surface",   command: "_ExtractSrf" },
+            { label: "Merge Faces",       command: "_MergeAllFaces" },
+        ]
+    },
+    {
+        label: "Modify — Mesh",
+        tools: [
+            { label: "Mesh from NURBS",   command: "_Mesh" },
+            { label: "Weld Mesh",         command: "_Weld" },
+            { label: "Unify Normals",     command: "_UnifyMeshNormals" },
+            { label: "Reduce Mesh",       command: "_ReduceMesh" },
+            { label: "Smooth",            command: "_Smooth" },
+            { label: "QuadRemesh",        command: "_QuadRemesh" },
+        ]
+    },
+    {
+        label: "SubD",
+        tools: [
+            { label: "SubD Box",          command: "_SubDBox" },
+            { label: "SubD Cylinder",     command: "_SubDCylinder" },
+            { label: "SubD Sphere",       command: "_SubDSphere" },
+            { label: "Crease Edge",       command: "_Crease" },
+            { label: "Remove Crease",     command: "_RemoveCrease" },
+            { label: "SubD to NURBS",     command: "_ToNURBS" },
+            { label: "NURBS to SubD",     command: "_ToSubD" },
+            { label: "Insert Edge",       command: "_InsertEdge" },
+            { label: "Bridge",            command: "_Bridge" },
+            { label: "Stitch",            command: "_Stitch" },
+        ]
+    },
+    {
+        label: "Analyze",
+        tools: [
+            { label: "Length",            command: "_Length" },
+            { label: "Area",              command: "_Area" },
+            { label: "Volume",            command: "_Volume" },
+            { label: "Distance",          command: "_Distance" },
+            { label: "Angle",             command: "_Angle" },
+            { label: "Bounding Box",      command: "_BoundingBox" },
+            { label: "Zebra",             command: "_Zebra" },
+            { label: "Curvature",         command: "_CurvatureAnalysis" },
+            { label: "Draft Angle",       command: "_DraftAngleAnalysis" },
+            { label: "Environment Map",   command: "_EMap" },
+            { label: "Check",             command: "_Check" },
+            { label: "What",              command: "_What" },
+        ]
+    },
+    {
+        label: "Drafting",
+        tools: [
+            { label: "Dimension Linear",  command: "_Dim" },
+            { label: "Dimension Aligned", command: "_DimAligned" },
+            { label: "Dimension Angle",   command: "_DimAngle" },
+            { label: "Dimension Radius",  command: "_DimRadius" },
+            { label: "Dimension Diameter",command: "_DimDiameter" },
+            { label: "Leader",            command: "_Leader" },
+            { label: "Hatch",             command: "_Hatch" },
+            { label: "Clipping Plane",    command: "_ClippingPlane" },
+        ]
+    },
+    {
+        label: "View",
+        tools: [
+            { label: "Zoom Extents",      command: "_Zoom _All _Extents" },
+            { label: "Zoom Selected",     command: "_Zoom _Selected" },
+            { label: "4-View Layout",     command: "_4View" },
+            { label: "Max Viewport",      command: "_MaxViewport" },
+            { label: "Named Views",       command: "_NamedView" },
+            { label: "Set View — Top",    command: "_SetView _World _Top" },
+            { label: "Set View — Front",  command: "_SetView _World _Front" },
+            { label: "Set View — Right",  command: "_SetView _World _Right" },
+            { label: "Set View — Persp",  command: "_SetView _World _Perspective" },
+            { label: "Set View — Bottom", command: "_SetView _World _Bottom" },
+            { label: "Set View — Back",   command: "_SetView _World _Back" },
+            { label: "Set View — Left",   command: "_SetView _World _Left" },
+        ]
+    },
+    {
+        label: "Display",
+        tools: [
+            { label: "Wireframe",         command: "_SetDisplayMode _Mode=Wireframe" },
+            { label: "Shaded",            command: "_SetDisplayMode _Mode=Shaded" },
+            { label: "Rendered",          command: "_SetDisplayMode _Mode=Rendered" },
+            { label: "Ghosted",           command: "_SetDisplayMode _Mode=Ghosted" },
+            { label: "X-Ray",             command: "_SetDisplayMode _Mode=X-Ray" },
+            { label: "Arctic",            command: "_SetDisplayMode _Mode=Arctic" },
+            { label: "Technical",         command: "_SetDisplayMode _Mode=Technical" },
+            { label: "Pen",               command: "_SetDisplayMode _Mode=Pen" },
+            { label: "Hide Objects",      command: "_Hide" },
+            { label: "Show Objects",      command: "_Show" },
+            { label: "Lock Objects",      command: "_Lock" },
+            { label: "Unlock All",        command: "_Unlock" },
+        ]
+    },
+    {
+        label: "Selection",
+        tools: [
+            { label: "Select All",        command: "_SelAll" },
+            { label: "Deselect All",      command: "_SelNone" },
+            { label: "Invert Selection",  command: "_SelInvert" },
+            { label: "Select Curves",     command: "_SelCrv" },
+            { label: "Select Surfaces",   command: "_SelSrf" },
+            { label: "Select Polysurfs",  command: "_SelPolysrf" },
+            { label: "Select Meshes",     command: "_SelMesh" },
+            { label: "Select SubD",       command: "_SelSubD" },
+            { label: "Select by Layer",   command: "_SelLayer" },
+            { label: "Select Duplicates", command: "_SelDup" },
+            { label: "Previous Selection",command: "_SelPrev" },
+        ]
+    },
+    {
+        label: "File",
+        tools: [
+            { label: "Save",              command: "_Save" },
+            { label: "Save As",           command: "_SaveAs" },
+            { label: "Import",            command: "_Import" },
+            { label: "Export Selected",   command: "_Export" },
+            { label: "Render",            command: "_Render" },
+            { label: "Undo",              command: "_Undo" },
+            { label: "Redo",              command: "_Redo" },
+        ]
+    },
+];
+
+// -----------------------------------------------------------------------
+// Action
+// -----------------------------------------------------------------------
+
+interface Settings {
+    category: string;
+    command:  string;
+    label:    string;
+    [key: string]: string; // satisfies JsonObject — all fields are strings
+}
+
+@action({ UUID: "com.rhino3d.tools.tool" })
+export class RhinoToolAction extends SingletonAction<Settings> {
+
+    async onWillAppear(ev: WillAppearEvent<Settings>): Promise<void> {
+        const label = ev.payload.settings.label?.trim();
+        if (label) await ev.action.setTitle(label);
+    }
+
+    async onDidReceiveSettings(ev: DidReceiveSettingsEvent<Settings>): Promise<void> {
+        const label = ev.payload.settings.label?.trim();
+        if (label) await ev.action.setTitle(label);
+    }
+
+    async onKeyDown(ev: KeyDownEvent<Settings>): Promise<void> {
+        const cmd = ev.payload.settings.command?.trim();
+        if (!cmd) { await ev.action.showAlert(); return; }
+
+        const ok = await sendCommandToRhino(cmd);
+        if (!ok) await ev.action.showAlert();
+    }
+}
+
+================================================================================
+FILE 7 of 9:  com.rhino3d.tools.sdPlugin/manifest.json
+================================================================================
+
+{
+  "Name": "Rhino 3D Tools",
+  "Version": "1.0.0",
+  "Author": "Rhino 3D Tools Plugin",
+  "Description": "One-press buttons for every Rhino 3D tool. Pick a command from the categorised list and it runs instantly — no typing needed.",
+  "Category": "Rhino 3D Tools",
+  "CategoryIcon": "imgs/category-icon",
+  "Icon": "imgs/plugin-icon",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 2,
+  "Software": { "MinimumVersion": "6.4" },
+  "OS": [{ "Platform": "windows", "MinimumVersion": "10" }],
+  "Nodejs": { "Version": "20", "Debug": "enabled" },
+  "Actions": [
+    {
+      "Name": "Rhino Tool",
+      "UUID": "com.rhino3d.tools.tool",
+      "Icon": "imgs/tool-default",
+      "Tooltip": "Pick any Rhino tool from a categorised list and press to run it",
+      "PropertyInspectorPath": "ui/tool-picker.html",
+      "SupportedInMultiActions": true,
+      "States": [
+        { "Image": "imgs/tool-default", "Name": "Default" }
+      ]
+    }
+  ]
+}
+
+================================================================================
+FILE 8 of 9:  com.rhino3d.tools.sdPlugin/ui/tool-picker.html
+================================================================================
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      background: #2d2d2d; color: #d8d8d8;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px; margin: 0; padding: 0;
+    }
+    .wrap { padding: 8px 10px 12px; }
+
+    label {
+      display: block; margin: 10px 0 3px;
+      font-weight: 600; color: #888;
+      text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em;
+    }
+
+    select {
+      width: 100%; background: #1a1a1a; color: #e0e0e0;
+      border: 1px solid #444; border-radius: 4px; padding: 6px 8px;
+      font-size: 12px; cursor: pointer;
+    }
+    select:focus { outline: none; border-color: #6c8ebf; }
+    select[size] { height: 138px; }
+
+    .search-row { position: relative; }
+    .search-row input {
+      width: 100%; background: #1a1a1a; color: #e0e0e0;
+      border: 1px solid #444; border-radius: 4px;
+      padding: 6px 26px 6px 8px; font-size: 12px;
+    }
+    .search-row input:focus { outline: none; border-color: #6c8ebf; }
+    .search-row input::placeholder { color: #555; }
+    .clear {
+      position: absolute; right: 7px; top: 50%; transform: translateY(-50%);
+      background: none; border: none; color: #555; cursor: pointer;
+      font-size: 15px; padding: 0; line-height: 1;
+    }
+    .clear:hover { color: #aaa; }
+
+    .meta { display: flex; justify-content: space-between; margin-top: 2px; }
+    .meta span { font-size: 10px; color: #555; }
+
+    .preview {
+      margin-top: 10px; background: #161616;
+      border: 1px solid #333; border-radius: 4px;
+      padding: 7px 10px;
+    }
+    .preview-title { font-size: 10px; color: #555; margin-bottom: 3px; }
+    .preview-cmd { font-family: monospace; font-size: 11px; color: #7ec8e3; word-break: break-all; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <label for="cat">Category</label>
+  <select id="cat"></select>
+
+  <label>Search</label>
+  <div class="search-row">
+    <input id="search" type="text" placeholder="e.g. boolean, loft, zoom…">
+    <button class="clear" id="clear" title="Clear">×</button>
+  </div>
+
+  <label for="tools">Tool</label>
+  <select id="tools" size="8"></select>
+  <div class="meta">
+    <span id="count"></span>
+    <span id="cat-hint"></span>
+  </div>
+
+  <div class="preview">
+    <div class="preview-title">Rhino command</div>
+    <div class="preview-cmd" id="cmd">—</div>
+  </div>
+
+</div>
+<script>
+const CATALOGUE = [
+  { label: "Draw — Curves", tools: [
+    { label: "Line",              command: "_Line" },
+    { label: "Polyline",          command: "_Polyline" },
+    { label: "Free-form Curve",   command: "_Curve" },
+    { label: "Arc",               command: "_Arc" },
+    { label: "Circle",            command: "_Circle" },
+    { label: "Ellipse",           command: "_Ellipse" },
+    { label: "Rectangle",         command: "_Rectangle" },
+    { label: "Polygon",           command: "_Polygon" },
+    { label: "Helix",             command: "_Helix" },
+    { label: "Spiral",            command: "_Spiral" },
+    { label: "Interpolate Pts",   command: "_InterpCrv" },
+    { label: "Sketch",            command: "_Sketch" },
+    { label: "Point",             command: "_Point" },
+    { label: "Text",              command: "_Text" },
+  ]},
+  { label: "Draw — Surfaces", tools: [
+    { label: "Plane",             command: "_Plane" },
+    { label: "Edge Surface",      command: "_EdgeSrf" },
+    { label: "Loft",              command: "_Loft" },
+    { label: "Sweep 1 Rail",      command: "_Sweep1" },
+    { label: "Sweep 2 Rails",     command: "_Sweep2" },
+    { label: "Revolve",           command: "_Revolve" },
+    { label: "Rail Revolve",      command: "_RailRevolve" },
+    { label: "Network Surface",   command: "_NetworkSrf" },
+    { label: "Planar Surface",    command: "_PlanarSrf" },
+    { label: "Patch",             command: "_Patch" },
+    { label: "Extrude Curve",     command: "_ExtrudeCrv" },
+    { label: "Extrude Surface",   command: "_ExtrudeSrf" },
+    { label: "Offset Surface",    command: "_OffsetSrf" },
+  ]},
+  { label: "Draw — Solids", tools: [
+    { label: "Box",               command: "_Box" },
+    { label: "Sphere",            command: "_Sphere" },
+    { label: "Cylinder",          command: "_Cylinder" },
+    { label: "Cone",              command: "_Cone" },
+    { label: "Truncated Cone",    command: "_TCone" },
+    { label: "Torus",             command: "_Torus" },
+    { label: "Pipe",              command: "_Pipe" },
+  ]},
+  { label: "Modify — Edit", tools: [
+    { label: "Trim",              command: "_Trim" },
+    { label: "Split",             command: "_Split" },
+    { label: "Extend",            command: "_Extend" },
+    { label: "Join",              command: "_Join" },
+    { label: "Explode",           command: "_Explode" },
+    { label: "Offset Curve",      command: "_Offset" },
+    { label: "Fillet Curves",     command: "_Fillet" },
+    { label: "Chamfer Curves",    command: "_Chamfer" },
+    { label: "Rebuild Curve",     command: "_Rebuild" },
+    { label: "Match Curves",      command: "_Match" },
+    { label: "Fair Curve",        command: "_Fair" },
+    { label: "Simplify Curve",    command: "_SimplifyCrv" },
+    { label: "Project Curve",     command: "_Project" },
+    { label: "Pull Curve",        command: "_Pull" },
+  ]},
+  { label: "Modify — Transform", tools: [
+    { label: "Move",              command: "_Move" },
+    { label: "Copy",              command: "_Copy" },
+    { label: "Rotate",            command: "_Rotate" },
+    { label: "Rotate 3D",         command: "_Rotate3D" },
+    { label: "Scale",             command: "_Scale" },
+    { label: "Scale 1D",          command: "_Scale1D" },
+    { label: "Scale 2D",          command: "_Scale2D" },
+    { label: "Mirror",            command: "_Mirror" },
+    { label: "Array Linear",      command: "_Array" },
+    { label: "Array Polar",       command: "_ArrayPolar" },
+    { label: "Array Along Crv",   command: "_ArrayCrv" },
+    { label: "Orient",            command: "_Orient" },
+    { label: "Orient on Srf",     command: "_OrientOnSrf" },
+    { label: "Flow Along Crv",    command: "_Flow" },
+    { label: "Bend",              command: "_Bend" },
+    { label: "Twist",             command: "_Twist" },
+    { label: "Taper",             command: "_Taper" },
+    { label: "Shear",             command: "_Shear" },
+  ]},
+  { label: "Modify — Solids", tools: [
+    { label: "Boolean Union",     command: "_BooleanUnion" },
+    { label: "Boolean Diff",      command: "_BooleanDifference" },
+    { label: "Boolean Intersect", command: "_BooleanIntersection" },
+    { label: "Boolean Split",     command: "_BooleanSplit" },
+    { label: "Fillet Edge",       command: "_FilletEdge" },
+    { label: "Chamfer Edge",      command: "_ChamferEdge" },
+    { label: "Shell",             command: "_Shell" },
+    { label: "Cap",               command: "_Cap" },
+    { label: "Extract Surface",   command: "_ExtractSrf" },
+    { label: "Merge Faces",       command: "_MergeAllFaces" },
+  ]},
+  { label: "Modify — Mesh", tools: [
+    { label: "Mesh from NURBS",   command: "_Mesh" },
+    { label: "Weld Mesh",         command: "_Weld" },
+    { label: "Unify Normals",     command: "_UnifyMeshNormals" },
+    { label: "Reduce Mesh",       command: "_ReduceMesh" },
+    { label: "Smooth",            command: "_Smooth" },
+    { label: "QuadRemesh",        command: "_QuadRemesh" },
+  ]},
+  { label: "SubD", tools: [
+    { label: "SubD Box",          command: "_SubDBox" },
+    { label: "SubD Cylinder",     command: "_SubDCylinder" },
+    { label: "SubD Sphere",       command: "_SubDSphere" },
+    { label: "Crease Edge",       command: "_Crease" },
+    { label: "Remove Crease",     command: "_RemoveCrease" },
+    { label: "SubD to NURBS",     command: "_ToNURBS" },
+    { label: "NURBS to SubD",     command: "_ToSubD" },
+    { label: "Insert Edge",       command: "_InsertEdge" },
+    { label: "Bridge",            command: "_Bridge" },
+    { label: "Stitch",            command: "_Stitch" },
+  ]},
+  { label: "Analyze", tools: [
+    { label: "Length",            command: "_Length" },
+    { label: "Area",              command: "_Area" },
+    { label: "Volume",            command: "_Volume" },
+    { label: "Distance",          command: "_Distance" },
+    { label: "Angle",             command: "_Angle" },
+    { label: "Bounding Box",      command: "_BoundingBox" },
+    { label: "Zebra",             command: "_Zebra" },
+    { label: "Curvature",         command: "_CurvatureAnalysis" },
+    { label: "Draft Angle",       command: "_DraftAngleAnalysis" },
+    { label: "Environment Map",   command: "_EMap" },
+    { label: "Check",             command: "_Check" },
+    { label: "What",              command: "_What" },
+  ]},
+  { label: "Drafting", tools: [
+    { label: "Dimension Linear",  command: "_Dim" },
+    { label: "Dimension Aligned", command: "_DimAligned" },
+    { label: "Dimension Angle",   command: "_DimAngle" },
+    { label: "Dimension Radius",  command: "_DimRadius" },
+    { label: "Dimension Diameter",command: "_DimDiameter" },
+    { label: "Leader",            command: "_Leader" },
+    { label: "Hatch",             command: "_Hatch" },
+    { label: "Clipping Plane",    command: "_ClippingPlane" },
+  ]},
+  { label: "View", tools: [
+    { label: "Zoom Extents",      command: "_Zoom _All _Extents" },
+    { label: "Zoom Selected",     command: "_Zoom _Selected" },
+    { label: "4-View Layout",     command: "_4View" },
+    { label: "Max Viewport",      command: "_MaxViewport" },
+    { label: "Named Views",       command: "_NamedView" },
+    { label: "Set View — Top",    command: "_SetView _World _Top" },
+    { label: "Set View — Front",  command: "_SetView _World _Front" },
+    { label: "Set View — Right",  command: "_SetView _World _Right" },
+    { label: "Set View — Persp",  command: "_SetView _World _Perspective" },
+    { label: "Set View — Bottom", command: "_SetView _World _Bottom" },
+    { label: "Set View — Back",   command: "_SetView _World _Back" },
+    { label: "Set View — Left",   command: "_SetView _World _Left" },
+  ]},
+  { label: "Display", tools: [
+    { label: "Wireframe",         command: "_SetDisplayMode _Mode=Wireframe" },
+    { label: "Shaded",            command: "_SetDisplayMode _Mode=Shaded" },
+    { label: "Rendered",          command: "_SetDisplayMode _Mode=Rendered" },
+    { label: "Ghosted",           command: "_SetDisplayMode _Mode=Ghosted" },
+    { label: "X-Ray",             command: "_SetDisplayMode _Mode=X-Ray" },
+    { label: "Arctic",            command: "_SetDisplayMode _Mode=Arctic" },
+    { label: "Technical",         command: "_SetDisplayMode _Mode=Technical" },
+    { label: "Pen",               command: "_SetDisplayMode _Mode=Pen" },
+    { label: "Hide Objects",      command: "_Hide" },
+    { label: "Show Objects",      command: "_Show" },
+    { label: "Lock Objects",      command: "_Lock" },
+    { label: "Unlock All",        command: "_Unlock" },
+  ]},
+  { label: "Selection", tools: [
+    { label: "Select All",        command: "_SelAll" },
+    { label: "Deselect All",      command: "_SelNone" },
+    { label: "Invert Selection",  command: "_SelInvert" },
+    { label: "Select Curves",     command: "_SelCrv" },
+    { label: "Select Surfaces",   command: "_SelSrf" },
+    { label: "Select Polysurfs",  command: "_SelPolysrf" },
+    { label: "Select Meshes",     command: "_SelMesh" },
+    { label: "Select SubD",       command: "_SelSubD" },
+    { label: "Select by Layer",   command: "_SelLayer" },
+    { label: "Select Duplicates", command: "_SelDup" },
+    { label: "Previous Selection",command: "_SelPrev" },
+  ]},
+  { label: "File", tools: [
+    { label: "Save",              command: "_Save" },
+    { label: "Save As",           command: "_SaveAs" },
+    { label: "Import",            command: "_Import" },
+    { label: "Export Selected",   command: "_Export" },
+    { label: "Render",            command: "_Render" },
+    { label: "Undo",              command: "_Undo" },
+    { label: "Redo",              command: "_Redo" },
+  ]},
+];
+
+const ALL = CATALOGUE.flatMap(c => c.tools.map(t => ({ ...t, category: c.label })));
+
+// DOM
+const catEl    = document.getElementById("cat");
+const toolsEl  = document.getElementById("tools");
+const searchEl = document.getElementById("search");
+const clearEl  = document.getElementById("clear");
+const cmdEl    = document.getElementById("cmd");
+const countEl  = document.getElementById("count");
+const hintEl   = document.getElementById("cat-hint");
+
+// Current saved state
+let saved = { category: "", command: "", label: "" };
+
+// Stream Deck WebSocket connection
+let websocket = null;
+let uuid      = null;
+
+// Called by Stream Deck when the PI loads
+function connectElgatoStreamDeckSocket(inPort, inUUID, inRegisterEvent, inInfo, inActionInfo) {
+  uuid = inUUID;
+
+  // Pre-populate from actionInfo settings (may be available immediately)
+  try {
+    const ai = JSON.parse(inActionInfo);
+    if (ai?.payload?.settings) applySettings(ai.payload.settings);
+  } catch { /* ignore */ }
+
+  websocket = new WebSocket("ws://127.0.0.1:" + inPort);
+
+  websocket.onopen = () => {
+    // Register this property inspector with Stream Deck
+    websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inUUID }));
+    // Ask for the current settings
+    websocket.send(JSON.stringify({ event: "getSettings", context: inUUID }));
+  };
+
+  websocket.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    if (msg.event === "didReceiveSettings") {
+      applySettings(msg.payload?.settings ?? {});
+    }
+  };
+}
+
+// Apply received settings to the UI (without triggering a save)
+function applySettings(s) {
+  saved = {
+    category: s.category ?? "",
+    command:  s.command  ?? "",
+    label:    s.label    ?? "",
+  };
+
+  // Set category dropdown
+  if (saved.category) catEl.value = saved.category;
+  if (!catEl.value)   catEl.value = CATALOGUE[0].label;
+
+  // Clear search so we see the right category
+  searchEl.value = "";
+
+  showCat(catEl.value);
+  restoreSelection();
+}
+
+// ---------- Build category dropdown ----------
+CATALOGUE.forEach(c => catEl.appendChild(new Option(c.label, c.label)));
+
+// ---------- Populate tool list ----------
+function populate(tools) {
+  toolsEl.innerHTML = "";
+  tools.forEach(t => {
+    const o = new Option(t.label, t.command);
+    o.dataset.label = t.label;
+    o.dataset.cat   = t.category || catEl.value;
+    toolsEl.appendChild(o);
+  });
+  countEl.textContent = `${tools.length} tool${tools.length !== 1 ? "s" : ""}`;
+}
+
+function showCat(catLabel) {
+  const c = CATALOGUE.find(x => x.label === catLabel);
+  populate(c ? c.tools.map(t => ({ ...t, category: catLabel })) : []);
+  hintEl.textContent = "";
+}
+
+function showSearch(q) {
+  const lq = q.toLowerCase();
+  const matches = ALL.filter(t =>
+    t.label.toLowerCase().includes(lq) ||
+    t.command.toLowerCase().includes(lq) ||
+    t.category.toLowerCase().includes(lq)
+  );
+  populate(matches);
+  hintEl.textContent = matches.length
+    ? `across ${new Set(matches.map(m => m.category)).size} categories`
+    : "";
+}
+
+// Select the saved command in the list; fall back to first item
+function restoreSelection() {
+  for (const o of toolsEl.options) {
+    if (o.value === saved.command) {
+      o.selected = true;
+      updatePreview(o);
+      return;
+    }
+  }
+  if (toolsEl.options.length) {
+    toolsEl.options[0].selected = true;
+    updatePreview(toolsEl.options[0]);
+  }
+}
+
+function updatePreview(opt) {
+  cmdEl.textContent = opt ? (opt.value || "—") : "—";
+}
+
+// Save settings to Stream Deck and update preview
+function saveCurrentSelection() {
+  const opt = toolsEl.options[toolsEl.selectedIndex];
+  if (!opt) return;
+  saved = {
+    category: opt.dataset.cat || catEl.value,
+    command:  opt.value,
+    label:    opt.dataset.label || opt.text,
+  };
+  updatePreview(opt);
+  if (websocket && websocket.readyState === WebSocket.OPEN) {
+    websocket.send(JSON.stringify({
+      event:   "setSettings",
+      context: uuid,
+      payload: saved,
+    }));
+  }
+}
+
+// ---------- Events ----------
+catEl.addEventListener("change", () => {
+  searchEl.value = "";
+  // Don't restore old selection when user explicitly switches category —
+  // just pick the first tool in the new category.
+  saved.command = "";
+  showCat(catEl.value);
+  restoreSelection();
+  saveCurrentSelection();
+});
+
+toolsEl.addEventListener("change", saveCurrentSelection);
+
+searchEl.addEventListener("input", () => {
+  const q = searchEl.value.trim();
+  if (!q) showCat(catEl.value);
+  else    showSearch(q);
+  restoreSelection();
+});
+
+clearEl.addEventListener("click", () => {
+  searchEl.value = "";
+  showCat(catEl.value);
+  restoreSelection();
+});
+
+// ---------- Initial render (before SD connects) ----------
+catEl.value = CATALOGUE[0].label;
+showCat(CATALOGUE[0].label);
+</script>
+</body>
+</html>
+
+================================================================================
+FILE 9 of 9:  generate-profile.mjs
+================================================================================
+
+#!/usr/bin/env node
+/**
+ * Generates and installs a Stream Deck V3 profile for Rhino 3D Tools.
+ * Uses official Rhino SVG icons composited onto category-coloured backgrounds.
+ *
+ * Usage:  node generate-profile.mjs
+ * Then:   restart Stream Deck software to see the "Rhino 3D Tools" profile
+ */
+
+import { deflateSync }                                              from "zlib";
+import { mkdirSync, writeFileSync, existsSync,
+         readdirSync, readFileSync, rmSync }                        from "fs";
+import { join }                                                     from "path";
+import { fileURLToPath }                                            from "url";
+import { dirname }                                                  from "path";
+import { randomUUID }                                               from "crypto";
+import { Resvg }                                                    from "@resvg/resvg-js";
+import { PNG }                                                      from "pngjs";
+
+const __dirname    = dirname(fileURLToPath(import.meta.url));
+const PROFILES_DIR = join(process.env.APPDATA, "Elgato", "StreamDeck", "ProfilesV3");
+const SVG_DIR      = "C:/Users/Phili/Documents/Claude/Code & Cowork/rhino_svgs";
+const PNG_DIR      = "C:/Users/Phili/Documents/Claude/Code & Cowork/rh4icons_32_iconimages";
+const COLS = 5, ROWS = 3;
+const CMD_SLOTS = COLS * ROWS - 2;   // 13 — reserve bottom-left & bottom-right for nav
+
+// ─── Device info from an existing SD profile ─────────────────────────────────
+
+let deviceModel = "20GBA9901";
+let deviceUUID  = "";
+
+try {
+    for (const entry of readdirSync(PROFILES_DIR)) {
+        const mPath = join(PROFILES_DIR, entry, "manifest.json");
+        if (!existsSync(mPath)) continue;
+        const m = JSON.parse(readFileSync(mPath, "utf8"));
+        if (m.Device?.Model?.match(/^20G/)) {
+            deviceModel = m.Device.Model;
+            deviceUUID  = m.Device.UUID;
+            break;
+        }
+    }
+} catch { /* use defaults */ }
+
+// ─── SVG → PNG compositing ────────────────────────────────────────────────────
+
+const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        t[n] = c;
+    }
+    return t;
+})();
+
+const crc32 = buf => {
+    let c = 0xFFFFFFFF;
+    for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+};
+
+const pngChunk = (type, data) => {
+    const t = Buffer.from(type, "ascii");
+    const len = Buffer.allocUnsafe(4);
+    const crcBuf = Buffer.allocUnsafe(4);
+    len.writeUInt32BE(data.length, 0);
+    crcBuf.writeUInt32BE(crc32(Buffer.concat([t, data])), 0);
+    return Buffer.concat([len, t, data, crcBuf]);
+};
+
+function rgbaToPNG(rgba, W, H) {
+    const raw = Buffer.alloc(H * (1 + W * 3));
+    for (let y = 0; y < H; y++) {
+        raw[y * (1 + W * 3)] = 0;
+        for (let x = 0; x < W; x++) {
+            const s = (y * W + x) * 4, d = y * (1 + W * 3) + 1 + x * 3;
+            raw[d] = rgba[s]; raw[d + 1] = rgba[s + 1]; raw[d + 2] = rgba[s + 2];
+        }
+    }
+    const ihdr = Buffer.allocUnsafe(13);
+    ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4);
+    ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = ihdr[11] = ihdr[12] = 0;
+    return Buffer.concat([
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+        pngChunk("IHDR", ihdr),
+        pngChunk("IDAT", deflateSync(raw)),
+        pngChunk("IEND", Buffer.alloc(0)),
+    ]);
+}
+
+function inRRect(x, y, x0, y0, x1, y1, r) {
+    if (x < x0 || x > x1 || y < y0 || y > y1) return false;
+    const c = (cx, cy) => (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
+    if (x < x0 + r && y < y0 + r) return c(x0 + r, y0 + r);
+    if (x > x1 - r && y < y0 + r) return c(x1 - r, y0 + r);
+    if (x < x0 + r && y > y1 - r) return c(x0 + r, y1 - r);
+    if (x > x1 - r && y > y1 - r) return c(x1 - r, y1 - r);
+    return true;
+}
+
+const W = 72, H = 72, ICON_SIZE = 44;
+
+/** Composite RGBA pixel block (iW×iH) onto the background buffer, centred */
+function compositePixels(rgba, px, iW, iH) {
+    const offX = Math.floor((W - iW) / 2);
+    const offY = Math.floor((H - iH) / 2);
+    for (let iy = 0; iy < iH; iy++) {
+        for (let ix = 0; ix < iW; ix++) {
+            const si = (iy * iW + ix) * 4;
+            const alpha = px[si + 3] / 255;
+            if (alpha < 0.01) continue;
+            const dx = ix + offX, dy = iy + offY;
+            if (dx < 0 || dx >= W || dy < 0 || dy >= H) continue;
+            const di = (dy * W + dx) * 4;
+            rgba[di]     = Math.round(px[si]     * alpha + rgba[di]     * (1 - alpha));
+            rgba[di + 1] = Math.round(px[si + 1] * alpha + rgba[di + 1] * (1 - alpha));
+            rgba[di + 2] = Math.round(px[si + 2] * alpha + rgba[di + 2] * (1 - alpha));
+        }
+    }
+}
+
+/**
+ * Build a 72×72 PNG: coloured rounded-rect background + Rhino icon.
+ * iconRef can be:
+ *   { type:"svg", name:"Line" }        — from rhino_svgs/ (recoloured white)
+ *   { type:"png", name:"EdgeSrf" }     — from rh4icons_32_iconimages/ (used as-is)
+ */
+function makeIcon(r, g, b, iconRef) {
+    const BG = [0x18, 0x18, 0x18];
+    const rgba = new Uint8Array(W * H * 4);
+
+    // Fill background
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            const i = (y * W + x) * 4;
+            const inBg = inRRect(x, y, 5, 5, 67, 67, 11);
+            rgba[i]     = inBg ? r : BG[0];
+            rgba[i + 1] = inBg ? g : BG[1];
+            rgba[i + 2] = inBg ? b : BG[2];
+            rgba[i + 3] = 255;
+        }
+    }
+
+    if (iconRef) {
+        try {
+            if (iconRef.type === "svg") {
+                const svgPath = join(SVG_DIR, `${iconRef.name}.svg`);
+                if (existsSync(svgPath)) {
+                    let svgSrc = readFileSync(svgPath, "utf8");
+                    svgSrc = svgSrc
+                        .replace(/stroke="black"/gi,   'stroke="white"')
+                        .replace(/stroke="#000000"/gi, 'stroke="white"')
+                        .replace(/stroke="#000"/gi,    'stroke="white"')
+                        .replace(/fill="black"/gi,     'fill="white"')
+                        .replace(/fill="#000000"/gi,   'fill="white"')
+                        .replace(/fill="#000"/gi,      'fill="white"');
+                    const resvg    = new Resvg(svgSrc, { fitTo: { mode: "width", value: ICON_SIZE } });
+                    const rendered = resvg.render();
+                    compositePixels(rgba, rendered.pixels, rendered.width, rendered.height);
+                }
+            } else if (iconRef.type === "png") {
+                const pngPath = join(PNG_DIR, `${iconRef.name}.png`);
+                if (existsSync(pngPath)) {
+                    const raw  = readFileSync(pngPath);
+                    const img  = PNG.sync.read(raw);
+                    // Scale up from 32×32 to ICON_SIZE×ICON_SIZE using nearest-neighbour
+                    const scale = ICON_SIZE / Math.max(img.width, img.height);
+                    const iW = Math.round(img.width  * scale);
+                    const iH = Math.round(img.height * scale);
+                    const scaled = new Uint8Array(iW * iH * 4);
+                    for (let iy = 0; iy < iH; iy++) {
+                        for (let ix = 0; ix < iW; ix++) {
+                            const sx = Math.floor(ix / scale);
+                            const sy = Math.floor(iy / scale);
+                            const si = (sy * img.width + sx) * 4;
+                            const di = (iy * iW + ix) * 4;
+                            scaled[di]     = img.data[si];
+                            scaled[di + 1] = img.data[si + 1];
+                            scaled[di + 2] = img.data[si + 2];
+                            scaled[di + 3] = img.data[si + 3];
+                        }
+                    }
+                    compositePixels(rgba, scaled, iW, iH);
+                }
+            }
+        } catch { /* icon error — use plain colour */ }
+    }
+
+    return rgbaToPNG(rgba, W, H);
+}
+
+// ─── Category colours ─────────────────────────────────────────────────────────
+
+const COLORS = {
+    "Draw — Curves":       [0x2d, 0x6e, 0xa4],
+    "Draw — Surfaces":     [0x1a, 0x87, 0x8a],
+    "Draw — Solids":       [0x1a, 0x6e, 0x5c],
+    "Modify — Edit":       [0x8a, 0x3d, 0x2d],
+    "Modify — Transform":  [0x8a, 0x5c, 0x1a],
+    "Modify — Solids":     [0x8a, 0x1a, 0x3d],
+    "Modify — Mesh":       [0x5c, 0x1a, 0x8a],
+    "SubD":                [0x3d, 0x6e, 0x1a],
+    "Analyze":             [0x6e, 0x1a, 0x8a],
+    "Drafting":            [0x1a, 0x5c, 0x8a],
+    "View":                [0x8a, 0x8a, 0x1a],
+    "Display":             [0x1a, 0x2d, 0x8a],
+    "Selection":           [0x3a, 0x8a, 0x1a],
+    "File":                [0x5c, 0x5c, 0x5c],
+};
+
+// ─── Icon mapping (command → { type, name }) ─────────────────────────────────
+// type "svg" = rhino_svgs folder (recoloured white)
+// type "png" = rh4icons_32_iconimages folder (used as-is, scaled up)
+
+const svg = name => ({ type: "svg", name });
+const png = name => ({ type: "png", name });
+
+const ICON_MAP = {
+    // Draw — Curves
+    "_Line":             svg("Line"),
+    "_Polyline":         svg("Polyline"),
+    "_Curve":            svg("Curve"),
+    "_Arc":              svg("Arc"),
+    "_Circle":           svg("Circle"),
+    "_Ellipse":          svg("Ellipse"),
+    "_Rectangle":        svg("Rectangle"),
+    "_Polygon":          svg("Polygon"),
+    "_Helix":            svg("Helix"),
+    "_Spiral":           svg("Spiral"),
+    "_InterpCrv":        svg("InterpCrv"),
+    "_Sketch":           svg("Sketch"),
+    "_Point":            svg("Point"),
+
+    // Draw — Surfaces
+    "_Plane":            svg("Plane"),
+    "_EdgeSrf":          png("EdgeSrf"),
+    "_Loft":             svg("SubDLoft"),
+    "_Sweep1":           svg("Sweep1"),
+    "_Sweep2":           svg("Sweep2"),
+    "_Revolve":          svg("Revolve"),
+    "_NetworkSrf":       png("NetworkSrf"),
+    "_PlanarSrf":        png("PlanarSrf"),
+    "_Patch":            svg("Surface_Patch"),
+    "_ExtrudeCrv":       svg("Extrude"),
+    "_ExtrudeSrf":       png("ExtrudeSrf"),
+    "_OffsetSrf":        svg("Surface_Tools_Offset_Surface"),
+
+    // Draw — Solids
+    "_Box":              svg("Box"),
+    "_Sphere":           svg("Sphere"),
+    "_Cylinder":         svg("Solids_Sidebar_Solid_Creation_Cylinder"),
+    "_Cone":             svg("Solids_Sidebar_Solid_Creation_Cone"),
+    "_TCone":            svg("Mesh_Creation_Mesh_TCone"),
+    "_Torus":            svg("Solids_Sidebar_Solid_Creation_Torus"),
+    "_Pipe":             svg("Solids_Sidebar_Pipe"),
+
+    // Modify — Edit
+    "_Trim":             svg("Trim"),
+    "_Split":            svg("Split"),
+    "_Extend":           svg("Extend"),
+    "_Join":             svg("Geometry_Fix_Main1_Join"),
+    "_Explode":          svg("Geometry_Fix_Main2_Explode"),
+    "_Offset":           svg("Offset"),
+    "_Fillet":           svg("Fillet"),
+    "_Chamfer":          svg("Chamfer"),
+    "_Rebuild":          svg("Rebuild_Curve"),
+    "_Match":            svg("Match"),
+    "_Fair":             svg("Fair"),
+    "_SimplifyCrv":      svg("SimplifyCrv"),
+    "_Project":          svg("Curve_From_Object_Curve Tools_Main1_Project_curves"),
+    "_Pull":             svg("Curve_From_Object_Pull_curve"),
+
+    // Modify — Transform
+    "_Move":             svg("Move"),
+    "_Copy":             svg("CopyObjectsToLayer"),
+    "_Rotate":           svg("Rotate"),
+    "_ArrayCrv":         png("ArrayCrv"),
+    "_Scale":            svg("Scale"),
+    "_Scale1D":          svg("Scale1D"),
+    "_Scale2D":          svg("Scale2D"),
+    "_Mirror":           svg("Mirror"),
+    "_Array":            svg("Array"),
+    "_ArrayPolar":       svg("ArrayPolar"),
+    "_Orient":           svg("Orient"),
+    "_OrientOnSrf":      svg("Transform_Orient_on_surface"),
+    "_Bend":             svg("Bend"),
+    "_Twist":            svg("Transform_Deformation_Tools_Twist"),
+    "_Taper":            svg("Transform_Deformation_Tools_Taper"),
+    "_Shear":            svg("Transform_Shear"),
+    "_Flow":             svg("Deformation_Tools_Flow along_curve"),
+
+    // Modify — Solids
+    "_BooleanUnion":        svg("Solid_Boolean_union"),
+    "_BooleanDifference":   svg("BooleanDifference"),
+    "_BooleanIntersection": svg("BooleanIntersection"),
+    "_BooleanSplit":        svg("Solid_Tools_Boolean_split"),
+    "_FilletEdge":          svg("Solid_Tools_Fillet_edges"),
+    "_ChamferEdge":         svg("Solid_Tools_Chamfer_Edges"),
+    "_Shell":               svg("Solid_Shell"),
+    "_Cap":                 svg("CapPlanarHoles"),
+    "_ExtractSrf":          svg("ExtractSurface"),
+    "_MergeAllFaces":       svg("Mesh_Tools_Merge_Faces"),
+
+    // Modify — Mesh
+    "_Mesh":             svg("Mesh_Creation"),
+    "_Weld":             svg("Weld"),
+    "_UnifyMeshNormals": svg("UnifyMeshNormals"),
+    "_ReduceMesh":       svg("ReduceMesh"),
+    "_Smooth":           svg("Smooth"),
+    "_QuadRemesh":       svg("QuadRemesh"),
+
+    // SubD
+    "_SubDBox":          svg("SubD_box"),
+    "_SubDCylinder":     svg("SubD_cylinder"),
+    "_SubDSphere":       svg("SubDSphere"),
+    "_Crease":           svg("Mesh_Utilities_SubD_Crease"),
+    "_RemoveCrease":     svg("Mesh_Utilities_SubD_Remove_crease"),
+    "_ToNURBS":          svg("ToNURBS"),
+    "_ToSubD":           svg("ToSubD"),
+    "_InsertEdge":       svg("InsertEdge"),
+    "_Bridge":           svg("Bridge"),
+    "_Stitch":           svg("Stitch"),
+
+    // Analyze
+    "_Length":           svg("Length"),
+    "_Area":             svg("AreaCentroid"),
+    "_Volume":           svg("Volume"),
+    "_Distance":         svg("Distance"),
+    "_Angle":            svg("Angle"),
+    "_BoundingBox":      png("BoundingBox"),
+    "_Zebra":            svg("Surface_Analysis_Zebra_analysis"),
+    "_CurvatureAnalysis":svg("Curvature"),
+    "_DraftAngleAnalysis":svg("DraftAngleAnalysis"),
+    "_EMap":             svg("TextureMappingUnwrap"),
+    "_Check":            svg("Check"),
+    "_What":             svg("DocumentProperties"),
+
+    // Drafting
+    "_Dim":              svg("Dim"),
+    "_DimAligned":       svg("DimAligned"),
+    "_DimAngle":         svg("DimAngle"),
+    "_DimRadius":        png("DimRadius"),
+    "_DimDiameter":      svg("DimDiameter"),
+    "_Text":             svg("EditText"),
+    "_Leader":           svg("Leader"),
+    "_Hatch":            svg("Hatch"),
+    "_ClippingPlane":    svg("ClippingSection"),
+
+    // View
+    "_Zoom _All _Extents": svg("ZoomExtents"),
+    "_Zoom _Selected":     svg("ZoomSelected"),
+    "_4View":              png("4View"),
+    "_MaxViewport":        svg("Maximize_restore_viewport"),
+    "_NamedView":          svg("SaveNamedView"),
+    "_SetView _World _Top":         svg("CPlaneTop"),
+    "_SetView _World _Front":       svg("Set_View_Render_Sidebar_Front_view"),
+    "_SetView _World _Right":       svg("CPlaneRight"),
+    "_SetView _World _Perspective": svg("Render_Sidebar_Perspective_view"),
+    "_SetView _World _Bottom":      svg("Set_View_Render_Sidebar_Bottom_view"),
+    "_SetView _World _Left":        svg("CPlaneLeft"),
+
+    // Display
+    "_SetDisplayMode _Mode=Wireframe": svg("WireframeViewport"),
+    "_SetDisplayMode _Mode=Shaded":    svg("ShadedViewport"),
+    "_SetDisplayMode _Mode=Rendered":  svg("RenderedViewport"),
+    "_SetDisplayMode _Mode=Ghosted":   svg("Display_Ghosted_viewport"),
+    "_SetDisplayMode _Mode=X-Ray":     svg("Display_XRay_viewport"),
+    "_SetDisplayMode _Mode=Arctic":    svg("Arctic_Mode"),
+    "_SetDisplayMode _Mode=Technical": svg("TechnicalDisplay"),
+    "_Hide":             svg("Geometry_Fix_Organic_Hide_objects"),
+    "_Show":             svg("Show"),
+    "_Lock":             svg("Lock"),
+    "_Unlock":           svg("UnlockSelected"),
+
+    // Selection
+    "_SelAll":           svg("SelAll"),
+    "_SelNone":          svg("SelNone"),
+    "_SelInvert":        svg("Invert_selection_and_hide_control_points"),
+    "_SelCrv":           svg("Select_Curves"),
+    "_SelSrf":           svg("Select_Surfaces"),
+    "_SelPolysrf":       svg("Select_Polysurfaces"),
+    "_SelMesh":          svg("SelMesh"),
+    "_SelSubD":          svg("SelSubDEdges"),
+    "_SelLayer":         svg("SelLayer"),
+    "_SelDup":           svg("SelDup"),
+    "_SelPrev":          svg("Select_previous_selection"),
+
+    // File
+    "_Save":             svg("Save"),
+    "_SaveAs":           svg("SaveAs"),
+    "_Import":           svg("File_Open"),
+    "_Export":           svg("File_Export"),
+    "_Render":           svg("Render_Tools_Standard_Render"),
+    "_Undo":             svg("Undo"),
+    "_Redo":             svg("Geometry_Fix_Standard_Redo"),
+};
+
+// ─── Tool catalogue ───────────────────────────────────────────────────────────
+
+const CATALOGUE = [
+    { label: "Draw — Curves", tools: [
+        { label: "Line",              command: "_Line" },
+        { label: "Polyline",          command: "_Polyline" },
+        { label: "Free-form Curve",   command: "_Curve" },
+        { label: "Arc",               command: "_Arc" },
+        { label: "Circle",            command: "_Circle" },
+        { label: "Ellipse",           command: "_Ellipse" },
+        { label: "Rectangle",         command: "_Rectangle" },
+        { label: "Polygon",           command: "_Polygon" },
+        { label: "Helix",             command: "_Helix" },
+        { label: "Spiral",            command: "_Spiral" },
+        { label: "Interpolate Pts",   command: "_InterpCrv" },
+        { label: "Sketch",            command: "_Sketch" },
+        { label: "Point",             command: "_Point" },
+    ]},
+    { label: "Draw — Surfaces", tools: [
+        { label: "Plane",             command: "_Plane" },
+        { label: "Edge Surface",      command: "_EdgeSrf" },
+        { label: "Loft",              command: "_Loft" },
+        { label: "Sweep 1 Rail",      command: "_Sweep1" },
+        { label: "Sweep 2 Rails",     command: "_Sweep2" },
+        { label: "Revolve",           command: "_Revolve" },
+        { label: "Rail Revolve",      command: "_RailRevolve" },
+        { label: "Network Surface",   command: "_NetworkSrf" },
+        { label: "Planar Surface",    command: "_PlanarSrf" },
+        { label: "Patch",             command: "_Patch" },
+        { label: "Extrude Curve",     command: "_ExtrudeCrv" },
+        { label: "Extrude Surface",   command: "_ExtrudeSrf" },
+        { label: "Offset Surface",    command: "_OffsetSrf" },
+    ]},
+    { label: "Draw — Solids", tools: [
+        { label: "Box",               command: "_Box" },
+        { label: "Sphere",            command: "_Sphere" },
+        { label: "Cylinder",          command: "_Cylinder" },
+        { label: "Cone",              command: "_Cone" },
+        { label: "Truncated Cone",    command: "_TCone" },
+        { label: "Torus",             command: "_Torus" },
+        { label: "Pipe",              command: "_Pipe" },
+    ]},
+    { label: "Modify — Edit", tools: [
+        { label: "Trim",              command: "_Trim" },
+        { label: "Split",             command: "_Split" },
+        { label: "Extend",            command: "_Extend" },
+        { label: "Join",              command: "_Join" },
+        { label: "Explode",           command: "_Explode" },
+        { label: "Offset Curve",      command: "_Offset" },
+        { label: "Fillet Curves",     command: "_Fillet" },
+        { label: "Chamfer Curves",    command: "_Chamfer" },
+        { label: "Rebuild Curve",     command: "_Rebuild" },
+        { label: "Match Curves",      command: "_Match" },
+        { label: "Fair Curve",        command: "_Fair" },
+        { label: "Simplify Curve",    command: "_SimplifyCrv" },
+        { label: "Project Curve",     command: "_Project" },
+        { label: "Pull Curve",        command: "_Pull" },
+    ]},
+    { label: "Modify — Transform", tools: [
+        { label: "Move",              command: "_Move" },
+        { label: "Copy",              command: "_Copy" },
+        { label: "Rotate",            command: "_Rotate" },
+        { label: "Rotate 3D",         command: "_Rotate3D" },
+        { label: "Scale",             command: "_Scale" },
+        { label: "Scale 1D",          command: "_Scale1D" },
+        { label: "Scale 2D",          command: "_Scale2D" },
+        { label: "Mirror",            command: "_Mirror" },
+        { label: "Array Linear",      command: "_Array" },
+        { label: "Array Polar",       command: "_ArrayPolar" },
+        { label: "Array Along Crv",   command: "_ArrayCrv" },
+        { label: "Orient",            command: "_Orient" },
+        { label: "Orient on Srf",     command: "_OrientOnSrf" },
+        { label: "Flow Along Crv",    command: "_Flow" },
+        { label: "Bend",              command: "_Bend" },
+        { label: "Twist",             command: "_Twist" },
+        { label: "Taper",             command: "_Taper" },
+        { label: "Shear",             command: "_Shear" },
+    ]},
+    { label: "Modify — Solids", tools: [
+        { label: "Boolean Union",     command: "_BooleanUnion" },
+        { label: "Boolean Diff",      command: "_BooleanDifference" },
+        { label: "Boolean Intersect", command: "_BooleanIntersection" },
+        { label: "Boolean Split",     command: "_BooleanSplit" },
+        { label: "Fillet Edge",       command: "_FilletEdge" },
+        { label: "Chamfer Edge",      command: "_ChamferEdge" },
+        { label: "Shell",             command: "_Shell" },
+        { label: "Cap",               command: "_Cap" },
+        { label: "Extract Surface",   command: "_ExtractSrf" },
+        { label: "Merge Faces",       command: "_MergeAllFaces" },
+    ]},
+    { label: "Modify — Mesh", tools: [
+        { label: "Mesh from NURBS",   command: "_Mesh" },
+        { label: "Weld Mesh",         command: "_Weld" },
+        { label: "Unify Normals",     command: "_UnifyMeshNormals" },
+        { label: "Reduce Mesh",       command: "_ReduceMesh" },
+        { label: "Smooth",            command: "_Smooth" },
+        { label: "QuadRemesh",        command: "_QuadRemesh" },
+    ]},
+    { label: "SubD", tools: [
+        { label: "SubD Box",          command: "_SubDBox" },
+        { label: "SubD Cylinder",     command: "_SubDCylinder" },
+        { label: "SubD Sphere",       command: "_SubDSphere" },
+        { label: "Crease Edge",       command: "_Crease" },
+        { label: "Remove Crease",     command: "_RemoveCrease" },
+        { label: "SubD to NURBS",     command: "_ToNURBS" },
+        { label: "NURBS to SubD",     command: "_ToSubD" },
+        { label: "Insert Edge",       command: "_InsertEdge" },
+        { label: "Bridge",            command: "_Bridge" },
+        { label: "Stitch",            command: "_Stitch" },
+    ]},
+    { label: "Analyze", tools: [
+        { label: "Length",            command: "_Length" },
+        { label: "Area",              command: "_Area" },
+        { label: "Volume",            command: "_Volume" },
+        { label: "Distance",          command: "_Distance" },
+        { label: "Angle",             command: "_Angle" },
+        { label: "Bounding Box",      command: "_BoundingBox" },
+        { label: "Zebra",             command: "_Zebra" },
+        { label: "Curvature",         command: "_CurvatureAnalysis" },
+        { label: "Draft Angle",       command: "_DraftAngleAnalysis" },
+        { label: "Environment Map",   command: "_EMap" },
+        { label: "Check",             command: "_Check" },
+        { label: "What",              command: "_What" },
+    ]},
+    { label: "Drafting", tools: [
+        { label: "Dim Linear",        command: "_Dim" },
+        { label: "Dim Aligned",       command: "_DimAligned" },
+        { label: "Dim Angle",         command: "_DimAngle" },
+        { label: "Dim Radius",        command: "_DimRadius" },
+        { label: "Dim Diameter",      command: "_DimDiameter" },
+        { label: "Leader",            command: "_Leader" },
+        { label: "Hatch",             command: "_Hatch" },
+        { label: "Clipping Plane",    command: "_ClippingPlane" },
+    ]},
+    { label: "View", tools: [
+        { label: "Zoom Extents",      command: "_Zoom _All _Extents" },
+        { label: "Zoom Selected",     command: "_Zoom _Selected" },
+        { label: "4-View",            command: "_4View" },
+        { label: "Max Viewport",      command: "_MaxViewport" },
+        { label: "Named Views",       command: "_NamedView" },
+        { label: "View Top",          command: "_SetView _World _Top" },
+        { label: "View Front",        command: "_SetView _World _Front" },
+        { label: "View Right",        command: "_SetView _World _Right" },
+        { label: "View Persp",        command: "_SetView _World _Perspective" },
+        { label: "View Bottom",       command: "_SetView _World _Bottom" },
+        { label: "View Back",         command: "_SetView _World _Back" },
+        { label: "View Left",         command: "_SetView _World _Left" },
+    ]},
+    { label: "Display", tools: [
+        { label: "Wireframe",         command: "_SetDisplayMode _Mode=Wireframe" },
+        { label: "Shaded",            command: "_SetDisplayMode _Mode=Shaded" },
+        { label: "Rendered",          command: "_SetDisplayMode _Mode=Rendered" },
+        { label: "Ghosted",           command: "_SetDisplayMode _Mode=Ghosted" },
+        { label: "X-Ray",             command: "_SetDisplayMode _Mode=X-Ray" },
+        { label: "Arctic",            command: "_SetDisplayMode _Mode=Arctic" },
+        { label: "Technical",         command: "_SetDisplayMode _Mode=Technical" },
+        { label: "Pen",               command: "_SetDisplayMode _Mode=Pen" },
+        { label: "Hide Objects",      command: "_Hide" },
+        { label: "Show Objects",      command: "_Show" },
+        { label: "Lock Objects",      command: "_Lock" },
+        { label: "Unlock All",        command: "_Unlock" },
+    ]},
+    { label: "Selection", tools: [
+        { label: "Select All",        command: "_SelAll" },
+        { label: "Deselect All",      command: "_SelNone" },
+        { label: "Invert Sel.",       command: "_SelInvert" },
+        { label: "Select Curves",     command: "_SelCrv" },
+        { label: "Select Surfaces",   command: "_SelSrf" },
+        { label: "Select Polysurfs",  command: "_SelPolysrf" },
+        { label: "Select Meshes",     command: "_SelMesh" },
+        { label: "Select SubD",       command: "_SelSubD" },
+        { label: "Select by Layer",   command: "_SelLayer" },
+        { label: "Select Dups",       command: "_SelDup" },
+        { label: "Prev. Selection",   command: "_SelPrev" },
+    ]},
+    { label: "File", tools: [
+        { label: "Save",              command: "_Save" },
+        { label: "Save As",           command: "_SaveAs" },
+        { label: "Import",            command: "_Import" },
+        { label: "Export Selected",   command: "_Export" },
+        { label: "Render",            command: "_Render" },
+        { label: "Undo",              command: "_Undo" },
+        { label: "Redo",              command: "_Redo" },
+    ]},
+];
+
+// ─── V3 action builder helpers ────────────────────────────────────────────────
+
+const idxToPos = i => `${i % COLS},${Math.floor(i / COLS)}`;
+
+function stateStyle(title, image, size = 9, align = "bottom", color = "#ffffff") {
+    return {
+        FontFamily: "", FontSize: size, FontStyle: "", FontUnderline: false,
+        Image: image,
+        OutlineThickness: 2, ShowTitle: true,
+        Title: title,
+        TitleAlignment: align, TitleColor: color,
+    };
+}
+
+function toolAction(tool, catLabel) {
+    const actionID = randomUUID().toUpperCase();
+    return {
+        ActionID:    actionID,
+        LinkedTitle: true,
+        Name:        tool.label,
+        Plugin:      { Name: "Rhino 3D Tools", UUID: "com.rhino3d.tools", Version: "1.0.0" },
+        Resources:   null,
+        Settings:    { category: catLabel, command: tool.command, label: tool.label },
+        State:       0,
+        States:      [stateStyle(tool.label, `Images/${actionID}.png`, 9, "bottom", "#ffffff")],
+        UUID:        "com.rhino3d.tools.tool",
+    };
+}
+
+function navAction(dir) {
+    const isNext  = dir === "next";
+    const actionID = randomUUID().toUpperCase();
+    const title   = isNext ? "Next →" : "← Prev";
+    return {
+        ActionID:    actionID,
+        LinkedTitle: true,
+        Name:        title,
+        Plugin:      { Name: "Pages", UUID: "com.elgato.streamdeck.page", Version: "1.0" },
+        Resources:   null,
+        Settings:    {},
+        State:       0,
+        States:      [stateStyle(title, null, 8, "middle", "#888888")],
+        UUID:        isNext ? "com.elgato.streamdeck.page.next"
+                            : "com.elgato.streamdeck.page.previous",
+    };
+}
+
+// ─── Build pages ──────────────────────────────────────────────────────────────
+
+const pages = [];
+
+for (const cat of CATALOGUE) {
+    const chunks = [];
+    for (let i = 0; i < cat.tools.length; i += CMD_SLOTS) chunks.push(cat.tools.slice(i, i + CMD_SLOTS));
+    chunks.forEach((chunk, ci) => {
+        const suffix = chunks.length > 1 ? ` (${ci + 1}/${chunks.length})` : "";
+        const short  = cat.label.includes(" — ") ? cat.label.split(" — ")[1] : cat.label;
+        pages.push({ name: short + suffix, catLabel: cat.label, tools: chunk });
+    });
+}
+
+// ─── Generate profile folder ──────────────────────────────────────────────────
+
+const PROFILE_UUID = randomUUID().toUpperCase();
+const profileRoot  = join(PROFILES_DIR, `${PROFILE_UUID}.sdProfile`);
+const profilesDir  = join(profileRoot, "Profiles");
+
+// Remove any old "Rhino 3D Tools" profile
+try {
+    for (const entry of readdirSync(PROFILES_DIR)) {
+        const mPath = join(PROFILES_DIR, entry, "manifest.json");
+        if (!existsSync(mPath)) continue;
+        const m = JSON.parse(readFileSync(mPath, "utf8"));
+        if (m.Name === "Rhino 3D Tools") rmSync(join(PROFILES_DIR, entry), { recursive: true, force: true });
+    }
+} catch { /* ignore */ }
+
+mkdirSync(profilesDir, { recursive: true });
+
+const pageUUIDs = pages.map(() => randomUUID().toUpperCase());
+let iconHits = 0, iconMisses = 0;
+
+pages.forEach((page, pi) => {
+    const pageDir = join(profilesDir, pageUUIDs[pi]);
+    mkdirSync(join(pageDir, "Images"), { recursive: true });
+
+    const [r, g, b] = COLORS[page.catLabel] ?? [0x55, 0x55, 0x55];
+    const actions = {};
+
+    page.tools.forEach((tool, ti) => {
+        let slot = ti;
+        const pos0_2 = COLS * (ROWS - 1);      // 10 — bottom-left
+        const pos4_2 = COLS * ROWS - 1;        // 14 — bottom-right
+        if (slot >= pos0_2) slot++;
+        if (slot >= pos4_2) slot++;
+        const pos = idxToPos(slot);
+
+        const iconRef = ICON_MAP[tool.command] ?? null;
+        if (iconRef) iconHits++; else iconMisses++;
+
+        const act = toolAction(tool, page.catLabel);
+        const actionData = act;
+
+        const icon = makeIcon(r, g, b, iconRef);
+        writeFileSync(join(pageDir, "Images", `${act.ActionID}.png`), icon);
+
+        actions[pos] = actionData;
+    });
+
+    // Nav buttons
+    actions[`0,${ROWS - 1}`]         = navAction("prev");
+    actions[`${COLS - 1},${ROWS - 1}`] = navAction("next");
+
+    writeFileSync(join(pageDir, "manifest.json"), JSON.stringify({
+        Controllers: [{ Actions: actions, Type: "Keypad" }],
+        Icon: "",
+        Name: page.name,
+    }));
+});
+
+// Root manifest
+writeFileSync(join(profileRoot, "manifest.json"), JSON.stringify({
+    Device:  { Model: deviceModel, UUID: deviceUUID },
+    Name:    "Rhino 3D Tools",
+    Pages:   { Current: pageUUIDs[0], Default: pageUUIDs[0], Pages: pageUUIDs },
+    Version: "3.0",
+}));
+
+// ─── Summary ──────────────────────────────────────────────────────────────────
+
+const total = CATALOGUE.reduce((n, c) => n + c.tools.length, 0);
+console.log(`\n✓  Profile installed to ProfilesV3`);
+console.log(`   Device  : ${deviceModel}  (${deviceUUID || "auto-detect"})`);
+console.log(`   Pages   : ${pages.length}`);
+console.log(`   Buttons : ${total}  (${iconHits} with Rhino SVG icons, ${iconMisses} with colour-only)`);
+console.log(`\n→  Fully quit Stream Deck (tray icon → Quit) then reopen it.`);
+console.log(`   The "Rhino 3D Tools" profile will appear in the Profiles list.\n`);
+
+================================================================================
+  HOW IT ALL WORKS — QUICK REFERENCE
+================================================================================
+
+ARCHITECTURE
+  Stream Deck runs bin/plugin.js (bundled Node.js) inside its own Electron
+  process. When a button is pressed, onKeyDown fires. The plugin spawns a
+  hidden PowerShell process that calls SendKeys.SendWait(), which types the
+  Rhino command string into whichever window currently has keyboard focus.
+  Because the Stream Deck hardware button press never touches window focus,
+  Rhino always stays active and receives the keystrokes.
+
+  Stream Deck software <──WebSocket──> plugin.js (Node)
+                                           │
+                                           └─ child_process.exec()
+                                                  │
+                                                  └─ powershell -WindowStyle Hidden
+                                                         │
+                                                         └─ SendKeys.SendWait("_Line ")
+                                                                │
+                                                                ▼
+                                                          Rhino command line
+
+SETTINGS PERSISTENCE (the tricky part)
+  Each button stores { category, command, label } as its settings object.
+  The Property Inspector (tool-picker.html) communicates with Stream Deck
+  via a WebSocket. The critical pattern is:
+    1. SD calls connectElgatoStreamDeckSocket() in the PI
+    2. PI opens ws://127.0.0.1:<port> and sends { event: "registerPropertyInspector" }
+    3. PI sends { event: "getSettings" } to fetch saved values
+    4. SD replies with { event: "didReceiveSettings", payload: { settings: {...} } }
+    5. On user change, PI sends { event: "setSettings", payload: { ... } }
+  Using window.parent.postMessage() does NOT work — must use the WebSocket.
+
+KEY BUGS FIXED DURING DEVELOPMENT
+  1. "All buttons fire the same command"
+     Cause:  PI used postMessage instead of WebSocket setSettings
+     Fix:    Rewrote PI to use connectElgatoStreamDeckSocket + WebSocket
+
+  2. "Buttons don't fire anything"
+     Cause:  @action decorator does NOT auto-register the action
+     Fix:    Added streamDeck.actions.registerAction(new RhinoToolAction())
+
+  3. "Only works after clicking Rhino with the mouse"
+     Cause:  PowerShell window was briefly stealing focus from Rhino
+     Fix:    Added -WindowStyle Hidden to the powershell command;
+             simplified to pure SendKeys — no Win32 focus manipulation
+
+  4. "Icons not showing on buttons"
+     Cause:  Profile manifest was missing Image field in States array
+     Fix:    Added "Image": "Images/{ActionID}.png" to each state object
+
+ADDING MORE COMMANDS
+  1. Add a { label, command } entry to CATALOGUE in both:
+       src/actions/rhino-tool.ts   (for the running plugin)
+       com.rhino3d.tools.sdPlugin/ui/tool-picker.html  (for the PI dropdown)
+  2. Add a matching entry to ICON_MAP in generate-profile.mjs
+  3. Run: npm run build && node generate-profile.mjs
+
+================================================================================
+  END OF FILE
+================================================================================

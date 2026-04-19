@@ -1,0 +1,4 @@
+node_modules/
+com.rhino3d.tools.sdPlugin/bin/
+*.js.map
+

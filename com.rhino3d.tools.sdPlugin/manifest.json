@@ -1,0 +1,27 @@
+{
+  "Name": "Rhino 3D Tools",
+  "Version": "1.0.0",
+  "Author": "Philip",
+  "Description": "One-press buttons for every Rhino 3D tool. Pick a command from the categorised list and it runs instantly — no typing needed.",
+  "Category": "Rhino 3D Tools",
+  "CategoryIcon": "imgs/category-icon",
+  "Icon": "imgs/plugin-icon",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 2,
+  "Software": { "MinimumVersion": "6.4" },
+  "OS": [{ "Platform": "windows", "MinimumVersion": "10" }],
+  "Nodejs": { "Version": "20", "Debug": "enabled" },
+  "Actions": [
+    {
+      "Name": "Rhino Tool",
+      "UUID": "com.rhino3d.tools.tool",
+      "Icon": "imgs/tool-default",
+      "Tooltip": "Pick any Rhino tool from a categorised list and press to run it",
+      "PropertyInspectorPath": "ui/tool-picker.html",
+      "SupportedInMultiActions": true,
+      "States": [
+        { "Image": "imgs/tool-default", "Name": "Default" }
+      ]
+    }
+  ]
+}
