@@ -2,7 +2,6 @@ import { exec } from "child_process";
 
 /**
  * Types a Rhino command into the active window, exactly like a keyboard macro.
- *
  * PowerShell runs hidden (no window, no focus stealing).
  * Stream Deck button presses don't steal focus, so Rhino stays active
  * and receives the keystrokes directly.
@@ -25,7 +24,12 @@ export function sendCommandToRhino(command: string): Promise<boolean> {
         exec(
             `powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ${encoded}`,
             { timeout: 5000 },
-            (err: Error | null) => resolve(err === null)
+            (err: Error | null, stdout: string, stderr: string) => {
+                if (err) {
+                    console.error("Rhino command failed:", err, "STDERR:", stderr);
+                }
+                resolve(err === null);
+            }
         );
     });
 }
